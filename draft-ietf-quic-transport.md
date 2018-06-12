@@ -89,6 +89,21 @@ informative:
     target:
      "https://web.archive.org/web/20150315054838/http://ha.ckers.org/slowloris/"
 
+  MCQUISTIN2015:
+    title: "Is Explicit Congestion Notification usable with UDP?"
+    author:
+      -
+       ins: S. McQuistin
+       name: Stephen McQuistin
+       org: "University of Glasgow"
+     -
+       ins: C. Perkins
+       name: Colin S. Perkins
+       org: "University of Glasgow"
+   date: 2015-10-28
+   publisher: "IMC '15 Proceedings of the 2015 Internet Measurement Conference"
+   target:
+      "https://csperkins.org/publications/2015/10/mcquistin2015ecn-udp.pdf"
 
 --- abstract
 
@@ -1479,6 +1494,35 @@ counters is less, then an ECN failure has occurred and ECN should be disabled.
 ECN is also disabled in case an ACK frame is received acknowledging any ECT sent
 packet.
 
+### ECN Black Hole Mitigation {#ecn-black-hole}
+
+When enabling marking IP packets as ECT there is a small risk {{MCQUISTIN2015}}
+that this action will cause the packet to be dropped by a network node. These
+miss-behaving nodes causes a black hole for ECN enabled IP packets. Without any
+type of mitigation an implementation following what is specified for ECN
+will when encountering a ECN black hole have a connection establishment failure.
+If the ECN black hole is encountered during an connection migration the
+connection may fail if there are no working fall back path.
+
+A basic mitigation strategy is that any packet needing retransmission during an
+ECN capability check is retransmitted marked as Not-ECT. This will ensure that
+connection establishment and connection migration proceeds. When the
+acknowledgement of a retransmitted Not-ECT packet is received by the sender and
+if no ECT or ECN-CE marked packet has been acknowledged at that time, ECN is
+disabled. Due to the uncertainty of the RTT estimate at connection establishment
+and connection migration it will not be uncommon that these packets are
+retransmitted and both the ECT and Not-ECT packets are acknowledged, and thus
+indicating ECN capability.
+
+The above mechanism is sensitive to single or few random losses at capability
+check time causing false indication of ECN black holes. Thus, the failure to
+establish ECN may be due random loss rather than an actual ECN black hole. Due
+to this, any type of caching of the result of the capability check for a
+particular path should expire quickly.
+
+The overhead of this mitigation mechanism is that during capability checking the
+actual used ECN marking per packet needs to be stored by the sender to correctly
+determine if ECN is working.
 
 ## Proof of Source Address Ownership {#address-validation}
 
@@ -1858,56 +1902,53 @@ are described more in detail below.
 
 #### Case 1, ECN capability was verified
 
-IP packets continue to be transmitted with the applicable ECT code
-point. One possible issue is that ECN does not work along the new path,
-either because of ECN bleaching in the network or because of OS network
-stack issues. This error case will manifest itself in that the ECT and
-CE counters do not increase as much as they should, or not at all. The
-sender detects this and consequently ECT marking is stopped and Not-ECT
-is used instead. The endpoint performing the check must store from which
-packet number the connection migration happened. This to ensure that
-packets after the connection migration occured are included in the
-ACK_ECN frame, and thus the new path is also measured rather than only
-the old. The paths cabability can be verified when at least one packet
-sent after connection migration has been acked.
+The ECN Capability check is performed by continuing to be transmit IP packets
+with the applicable ECT code point. One possible outcome is that ECN does not
+work along the new path, either because of ECN bleaching in the network or
+because of OS network stack issues. This error case will manifest itself in that
+the ECT and CE counters do not increase as much as they should, or not at all.
+The sender detects this and consequently ECT marking is stopped and Not-ECT is
+used instead. The endpoint performing the check must store from which packet
+number the connection migration happened. This to ensure that packets after the
+connection migration occurred are included in the ACK_ECN frame, and thus the
+new path is also measured rather than only the old. The paths capability can be
+verified when at least one packet sent after connection migration has been
+acknowledged.
 
 
 #### Case 2, ECN capability had previously failed
 
-The applicable ECT codepoint is set in the IP packets sent on the new
-path during and after the path migration, and then the ECN capability
-check as defined in {{ecn-capability-check}} is performed. However, some
-special considerations are needed due to the in mid connection check.
-The packet number for the first packet sent after the connection
-migration occured is stored. For the latest received ACK_ECN the ECT(0),
-ECT(1) and ECN-CE counters (ECN counters) need to be stored for later
-comparision. If no ACK_ECN has ever been received, then the all of the
-ECN counters are assumed to be zero. The ECN counters may be non-zero if
-the connection had a ECN capable path for a period that then was
-migrated or stopped working.
-
+The ECN capability check is initiated by setting the applicable ECT code point
+in the IP packets sent on the new path during and after the path migration, and
+then the ECN capability check as defined in {{ecn-capability-check}} is
+performed. However, some special considerations are needed due to the in mid
+connection check. The packet number for the first packet sent after the
+connection migration occurred is stored. For the latest received ACK_ECN the
+ECT(0), ECT(1) and ECN-CE counters (ECN counters) need to be stored for later
+comparison. If no ACK_ECN has ever been received, then the all of the ECN
+counters are assumed to be zero. The ECN counters may be non-zero if the
+connection had a ECN capable path for a period that then was migrated or stopped
+working.
 
 If an ACK_ECN is received after a connection migration, but it contains
 acknowledgements for packets prior to the migration, then the stored ECN
-counters are updated with the values in the received ACK_ECN, also the
-value of the Largest Acknowledged, and a list of outstanding packet
-prior in sequence number to Largest Acknowledged are stored, but no
-further back then connection migration. If an ACK_ECN acknowleging only
-packets sent after connection migration is received, then then
-comparision is performed. First the number of ACKed packets are
-computed, by calculating how many packets with sequence number larger
-than Largest Acknowledged have been acknowledged, to that is added the
-number of packets of the outstanding that also have been acknolwedged.
-If the value of ACKed packets are non-zero, then the changes of the ECN
-counters between the stored and newely received are compared. If the sum
-of changes across the ECT(0), ECT(1) and ECN-CE are equal or larger than
-the number of ACKed packets, then ECN is confirmed to work. If an ACK
-frame is received, which acknowledge a non-zero number of packets that
-have a PN higher than the point of migration, it is concluded that ECN
-is not functional on the new path, and the ECT marking of any sent
-packets are stopped, and the packets will be marked as Non-ECT (00).
-
-
+counters are updated with the values in the received ACK_ECN, also the value of
+the previously Largest Acknowledged, and a list of outstanding packet prior in
+sequence number to Largest Acknowledged are stored, but no further back then the
+point of the connection migration. If an ACK_ECN acknowledging only packets sent
+after connection migration is received, then then comparison is performed. First
+the number of acknowledged packets are computed, by calculating how many packets
+with sequence number larger than previously received Largest Acknowledged have
+been acknowledged, to that is added the number of packets of the outstanding
+that also have been acknowledged. If the value of newly acknowledged packets are
+non-zero, then the changes of the ECN counters between the stored and newly
+received are compared. If the sum of changes across the ECT(0), ECT(1) and
+ECN-CE are equal or larger than the number of newly acknowledged packets, then
+ECN is confirmed to work. If an ACK frame is received, which acknowledge a
+non-zero number of packets that have a packet number higher than the point of
+migration, it is concluded that ECN is not functional on the new path, and the
+ECT marking of any sent packets are stopped, and the packets will be marked as
+Non-ECT (00).
 
 ### Loss Detection and Congestion Control {#migration-cc}
 
