@@ -89,6 +89,21 @@ informative:
     target:
      "https://web.archive.org/web/20150315054838/http://ha.ckers.org/slowloris/"
 
+  MCQUISTIN2015:
+    title: "Is Explicit Congestion Notification usable with UDP?"
+    author:
+      -
+       ins: S. McQuistin
+       name: Stephen McQuistin
+       org: "University of Glasgow"
+     -
+       ins: C. Perkins
+       name: Colin S. Perkins
+       org: "University of Glasgow"
+   date: 2015-10-28
+   publisher: "IMC '15 Proceedings of the 2015 Internet Measurement Conference"
+   target:
+      "https://csperkins.org/publications/2015/10/mcquistin2015ecn-udp.pdf"
 
 --- abstract
 
@@ -1479,6 +1494,35 @@ counters is less, then an ECN failure has occurred and ECN should be disabled.
 ECN is also disabled in case an ACK frame is received acknowledging any ECT sent
 packet.
 
+### ECN Black Hole Mitigation {#ecn-black-hole}
+
+When enabling marking IP packets as ECT there is a small risk {{MCQUISTIN2015}}
+that this action will cause the packet to be dropped by a network node. These
+miss-behaving nodes causes a black hole for ECN enabled IP packets. Without any
+type of mitigation an implementation following what is specified for ECN
+will when encountering a ECN black hole have a connection establishment failure.
+If the ECN black hole is encountered during an connection migration the
+connection may fail if there are no working fall back path.
+
+A basic mitigation strategy is that any packet needing retransmission during an
+ECN capability check is retransmitted marked as Not-ECT. This will ensure that
+connection establishment and connection migration proceeds. When the
+acknowledgement of a retransmitted Not-ECT packet is received by the sender and
+if no ECT or ECN-CE marked packet has been acknowledged at that time, ECN is
+disabled. Due to the uncertainty of the RTT estimate at connection establishment
+and connection migration it will not be uncommon that these packets are
+retransmitted and both the ECT and Not-ECT packets are acknowledged, and thus
+indicating ECN capability.
+
+The above mechanism is sensitive to single or few random losses at capability
+check time causing false indication of ECN black holes. Thus, the failure to
+establish ECN may be due random loss rather than an actual ECN black hole. Due
+to this, any type of caching of the result of the capability check for a
+particular path should expire quickly.
+
+The overhead of this mitigation mechanism is that during capability checking the
+actual used ECN marking per packet needs to be stored by the sender to correctly
+determine if ECN is working.
 
 ## Proof of Source Address Ownership {#address-validation}
 
