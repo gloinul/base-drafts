@@ -261,15 +261,24 @@ the stream management.
 All client-initiated bidirectional streams are used for HTTP requests and
 responses.  A bidirectional stream ensures that the response can be readily
 correlated with the request. This means that the client's first request occurs
-on QUIC stream 0, with subsequent requests on stream 4, 8, and so on. HTTP/QUIC
-does not use server-initiated bidirectional streams. The use of unidirectional
-streams is discussed in {{unidirectional-streams}}.
+on QUIC stream 0, with subsequent requests on stream 4, 8, and so on. In order
+to permit these streams to open, an HTTP/QUIC client SHOULD send non-zero values
+for the QUIC transport parameters `initial_max_stream_data_bidi_local`. An
+HTTP/QUIC server SHOULD send non-zero values for the QUIC transport parameters
+`initial_max_stream_data_bidi_remote` and `initial_max_bidi_streams`. It is
+recommended that `initial_max_bidi_streams` be no smaller than 100, so as to not
+unnecessarily limit parallelism.
 
 These streams carry frames related to the request/response (see {{frames}}).
 When a stream terminates cleanly, if the last frame on the stream was truncated,
 this MUST be treated as a connection error (see HTTP_MALFORMED_FRAME in
 {{http-error-codes}}).  Streams which terminate abruptly may be reset at any
 point in the frame.
+
+HTTP/QUIC does not use server-initiated bidirectional streams. The use of
+unidirectional streams is discussed in {{unidirectional-streams}}.  Both clients
+and servers SHOULD send a value of three or greater for the QUIC transport
+parameter `initial_max_uni_streams`.
 
 HTTP does not need to do any separate multiplexing when using QUIC - data sent
 over a QUIC stream always maps to a particular HTTP transaction. Requests and
@@ -556,9 +565,11 @@ The control stream is indicated by a stream type of `0x43` (ASCII 'C').  Data on
 this stream consists of HTTP/QUIC frames, as defined in {{frames}}.
 
 Each side MUST initiate a single control stream at the beginning of the
-connection and send its SETTINGS frame as the first frame on this stream.  Only
-one control stream per peer is permitted; receipt of a second stream which
-claims to be a control stream MUST be treated as a connection error of type
+connection and send its SETTINGS frame as the first frame on this stream.  If
+the first frame of the control stream is any other frame type, this MUST be
+treated as a connection error of type HTTP_MISSING_SETTINGS. Only one control
+stream per peer is permitted; receipt of a second stream which claims to be a
+control stream MUST be treated as a connection error of type
 HTTP_WRONG_STREAM_COUNT.  If the control stream is closed at any point, this
 MUST be treated as a connection error of type HTTP_CLOSED_CRITICAL_STREAM.
 
@@ -875,27 +886,22 @@ the same parameter more than once as a connection error of type
 HTTP_MALFORMED_FRAME.
 
 The payload of a SETTINGS frame consists of zero or more parameters, each
-consisting of an unsigned 16-bit setting identifier and a length-prefixed binary
-value.
+consisting of an unsigned 16-bit setting identifier and a value which uses the
+QUIC variable-length integer encoding.
 
 ~~~~~~~~~~~~~~~  drawing
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|         Identifier (16)       |            Length (i)       ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                          Contents (?)                       ...
+|         Identifier (16)       |           Value (i)         ...
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ~~~~~~~~~~~~~~~
 {: #fig-ext-settings title="SETTINGS value format"}
 
-A zero-length content indicates that the setting value is a Boolean and true.
-False is indicated by the absence of the setting.
-
-Non-zero-length values MUST be compared against the remaining length of the
-SETTINGS frame.  Any value which purports to cross the end of the frame MUST
-cause the SETTINGS frame to be considered malformed and trigger a connection
-error of type HTTP_MALFORMED_FRAME.
+Each value MUST be compared against the remaining length of the SETTINGS frame.
+Any value which purports to cross the end of the frame MUST cause the SETTINGS
+frame to be considered malformed and trigger a connection error of type
+HTTP_MALFORMED_FRAME.
 
 An implementation MUST ignore the contents for any SETTINGS identifier it does
 not understand.
@@ -913,21 +919,15 @@ SETTINGS frame MUST be treated as a connection error ({{errors}}) of type
 HTTP_MALFORMED_FRAME.
 
 
-#### Integer encoding
-
-Settings which are integers use the QUIC variable-length integer encoding.
-
 #### Defined SETTINGS Parameters {#settings-parameters}
 
 The following settings are defined in HTTP/QUIC:
 
   SETTINGS_NUM_PLACEHOLDERS (0x3):
-  : An integer with a maximum value of 2^16 - 1.  The value SHOULD be non-zero.
-    The default value is 16.
+  : This value SHOULD be non-zero.  The default value is 16.
 
   SETTINGS_MAX_HEADER_LIST_SIZE (0x6):
-  : An integer with a maximum value of 2^30 - 1.  The default value is
-    unlimited.
+  : The default value is unlimited.
 
 Settings values of the format `0x?a?a` are reserved to exercise the requirement
 that unknown parameters be ignored.  Such settings have no defined meaning.
@@ -1270,6 +1270,9 @@ HTTP_EARLY_RESPONSE (0x0011):
 : The remainder of the client's request is not needed to produce a response.
   For use in STOP_SENDING only.
 
+HTTP_MISSING_SETTINGS (0x0012):
+: No SETTINGS frame was received at the beginning of the control stream.
+
 HTTP_GENERAL_PROTOCOL_ERROR (0x00FF):
 : Peer violated protocol requirements in a way which doesn't match a more
   specific error code, or endpoint declines to use the more specific error code.
@@ -1477,6 +1480,12 @@ SETTINGS_MAX_FRAME_SIZE:
 
 SETTINGS_MAX_HEADER_LIST_SIZE:
 : See {{settings-parameters}}.
+
+In HTTP/QUIC, setting values are variable-length integers (6, 14, 30, or 62 bits
+long) rather than fixed-length 32-bit fields as in HTTP/2.  This will often
+produce a shorter encoding, but can produce a longer encoding for settings which
+use the full 32-bit space.  Settings ported from HTTP/2 might choose to redefine
+the format of their settings to avoid using the 62-bit encoding.
 
 Settings need to be defined separately for HTTP/2 and HTTP/QUIC.  The IDs of
 settings defined in {{!RFC7540}} have been reserved for simplicity.  See
@@ -1742,6 +1751,7 @@ The entries in the following table are registered by this document.
 | HTTP_CLOSED_CRITICAL_STREAM         | 0x000F     | Critical stream was closed               | {{http-error-codes}}   |
 | HTTP_WRONG_STREAM_DIRECTION         | 0x0010     | Unidirectional stream in wrong direction | {{http-error-codes}}   |
 | HTTP_EARLY_RESPONSE                 | 0x0011     | Remainder of request not needed          | {{http-error-codes}}   |
+| HTTP_MISSING_SETTINGS               | 0x0012     | No SETTINGS frame received               | {{http-error-codes}}   |
 | HTTP_MALFORMED_FRAME                | 0x01XX     | Error in frame formatting or use         | {{http-error-codes}}   |
 | ----------------------------------- | ---------- | ---------------------------------------- | ---------------------- |
 
@@ -1798,6 +1808,15 @@ Sender:
 
 > **RFC Editor's Note:**  Please remove this section prior to publication of a
 > final version of this document.
+
+## Since draft-ietf-quic-http-14
+
+- Recommend sensible values for QUIC transport parameters (#1720,#1806)
+- Define error for missing SETTINGS frame (#1697,#1808)
+- Setting values are variable-length integers (#1556,#1807) and do not have
+  separate maximum values (#1820)
+- Expanded discussion of connection closure (#1599,#1717,#1712)
+- HTTP_VERSION_FALLBACK falls back to HTTP/1.1 (#1677,#1685)
 
 ## Since draft-ietf-quic-http-13
 

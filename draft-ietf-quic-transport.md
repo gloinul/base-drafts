@@ -621,10 +621,17 @@ packet. It also sets the Token field to the token provided in the Retry. The
 client MUST NOT change the Source Connection ID because the server could include
 the connection ID as part of its token validation logic (see {{tokens}}).
 
+All subsequent Initial packets from the client MUST use the connection ID and
+token values from the Retry packet.  Aside from this, the Initial packet sent
+by the client is subject to the same restrictions as the first Initial packet.
+A client can either reuse the cryptographic handshake message or construct a
+new one at its discretion.
+
 A client MAY attempt 0-RTT after receiving a Retry packet by sending 0-RTT
 packets to the connection ID provided by the server.  A client that sends
-additional 0-RTT packets MUST NOT reset the packet number to 0 after a Retry
-packet, see {{retry-0rtt-pn}}.
+additional 0-RTT packets without constructing a new cryptographic handshake
+message MUST NOT reset the packet number to 0 after a Retry packet, see
+{{retry-0rtt-pn}}.
 
 A server acknowledges the use of a Retry packet for a connection using the
 original_connection_id transport parameter (see
@@ -875,11 +882,18 @@ The first Handshake packet sent by a server contains a packet number of 0.
 Handshake packets are their own packet number space.  Packet numbers are
 incremented normally for other Handshake packets.
 
-Servers MUST NOT send more than three datagrams including Initial and Handshake
-packets without receiving a packet from a verified source address.  Source
-addresses can be verified through an address validation token
-(delivered via a Retry packet or a NEW_TOKEN frame) or by receiving
-any message from the client encrypted using the Handshake keys.
+Servers MUST NOT send more than three times as many bytes as the number of bytes
+received prior to verifying the client's address.  Source addresses can be
+verified through an address validation token (delivered via a Retry packet or
+a NEW_TOKEN frame) or by processing any message from the client encrypted using
+the Handshake keys.  This limit exists to mitigate amplification attacks.
+
+In order to prevent this limit causing a handshake deadlock, the client SHOULD
+always send a packet upon a handshake timeout, as described in
+{{QUIC-RECOVERY}}.  If the client has no data to retransmit and does not have
+Handshake keys, it SHOULD send an Initial packet in a UDP datagram of at least
+1200 octets.  If the client has Handshake keys, it SHOULD send a Handshake
+packet.
 
 The payload of this packet contains CRYPTO frames and could contain PADDING, or
 ACK frames. Handshake packets MAY contain CONNECTION_CLOSE or APPLICATION_CLOSE
@@ -1125,7 +1139,8 @@ Stateless Reset do not contain frames.
 {: #packet-frames title="QUIC Payload"}
 
 QUIC payloads MUST contain at least one frame, and MAY contain multiple
-frames and multiple frame types.
+frames and multiple frame types. Endpoints that receive a packet containing
+no frames MAY terminate the connection with error PROTOCOL_VIOLATION.
 
 Frames MUST fit within a single QUIC packet and MUST NOT span a QUIC packet
 boundary. Each frame begins with a Frame Type, indicating its type, followed by
@@ -1163,14 +1178,13 @@ document.
 | 0x0a        | STREAM_ID_BLOCKED    | {{frame-stream-id-blocked}}    |
 | 0x0b        | NEW_CONNECTION_ID    | {{frame-new-connection-id}}    |
 | 0x0c        | STOP_SENDING         | {{frame-stop-sending}}         |
-| 0x0d        | ACK                  | {{frame-ack}}                  |
+| 0x0d        | RETIRE_CONNECTION_ID | {{frame-retire-connection-id}} |
 | 0x0e        | PATH_CHALLENGE       | {{frame-path-challenge}}       |
 | 0x0f        | PATH_RESPONSE        | {{frame-path-response}}        |
 | 0x10 - 0x17 | STREAM               | {{frame-stream}}               |
 | 0x18        | CRYPTO               | {{frame-crypto}}               |
 | 0x19        | NEW_TOKEN            | {{frame-new-token}}            |
-| 0x1a        | ACK_ECN              | {{frame-ack-ecn}}              |
-| 0x1b        | RETIRE_CONNECTION_ID | {{frame-retire-connection-id}} |
+| 0x1a - 0x1b | ACK                  | {{frame-ack}}                  |
 {: #frame-types title="Frame Types"}
 
 All QUIC frames are idempotent.  That is, a valid frame does not cause
@@ -1200,6 +1214,11 @@ that a peer is able to understand the frame.  An endpoint can use a transport
 parameter to signal its willingness to receive one or more extension frame types
 with the one transport parameter.
 
+Extension frames MUST be congestion controlled and MUST cause an ACK frame to
+be sent.  The exception is extension frames that replace or supplement the ACK
+frame.  Extension frames are not included in flow control unless specified
+in the extension.
+
 An IANA registry is used to manage the assignment of frame types, see
 {{iana-frames}}.
 
@@ -1218,7 +1237,8 @@ endpoint, as described in {{termination}}.
 
 Each connection possesses a set of identifiers, any of which could be used to
 distinguish it from other connections.  Connection IDs are selected
-independently in each direction.
+independently in each direction.  Each Connection ID has an associated sequence
+number to assist in deduplicating messages.
 
 The primary function of a connection ID is to ensure that changes in addressing
 at lower protocol layers (UDP, IP, and below) don't cause packets for a QUIC
@@ -1228,7 +1248,9 @@ deployment-specific) method which will allow packets with that connection ID to
 be routed back to the endpoint and identified by the endpoint upon receipt.
 
 Connection IDs MUST NOT contain any information that can be used to correlate
-them with other connection IDs for the same connection.
+them with other connection IDs for the same connection.  As a trivial example,
+this means the same connection ID MUST NOT be issued more than once on the same
+connection.
 
 A zero-length connection ID MAY be used when the connection ID is not needed for
 routing and the address/port tuple of packets is sufficient to identify a
@@ -1245,8 +1267,14 @@ using the NEW_CONNECTION_ID frame ({{frame-new-connection-id}}).
 ### Issuing Connection IDs
 
 The initial connection ID issued by an endpoint is the Source Connection ID
-during the handshake.  Subsequent connection IDs are communicated to the peer
-using NEW_CONNECTION_ID frames ({{frame-new-connection-id}}).
+during the handshake.  The sequence number of the initial connection ID is 0. If
+the preferred_address transport parameter is sent, the sequence number of the
+supplied connection ID is 1. Subsequent connection IDs are communicated to the
+peer using NEW_CONNECTION_ID frames ({{frame-new-connection-id}}), and the
+sequence number on each newly-issued connection ID MUST increase by 1. The
+connection ID randomly selected by the client in the Initial packet and any
+connection ID provided by a Reset packet are not assigned sequence numbers
+unless a server opts to retain them as its initial connection ID.
 
 When an endpoint issues a connection ID, it MUST accept packets that carry this
 connection ID for the duration of the connection or until its peer invalidates
@@ -1264,7 +1292,7 @@ with new connection IDs before migration, or risk the peer closing the
 connection.
 
 
-### Consuming and Retiring Connection IDs
+### Consuming and Retiring Connection IDs {#retiring-cids}
 
 An endpoint can change the connection ID it uses for a peer to another available
 one at any time during the connection.  An endpoint consumes connection IDs in
@@ -1276,12 +1304,9 @@ connection ID from use, it sends a RETIRE_CONNECTION_ID frame to its peer,
 indicating that the peer might bring a new connection ID into circulation using
 the NEW_CONNECTION_ID frame.
 
-An endpoint that retires a connection ID should retain knowledge of that
-connection ID for a period of time after sending the RETIRE_CONNECTION_ID frame,
-or until that frame is acknowledged.  A recommended time is three times the
-current retransmission timeout (RTO) interval as defined in {{QUIC-RECOVERY}}.
-This prevents a retransmission of a NEW_CONNECTION_ID frame from incorrectly
-renewing a previously retired connection ID.
+An endpoint that retires a connection ID can retain knowledge of that connection
+ID for a period of time after sending the RETIRE_CONNECTION_ID frame, or until
+that frame is acknowledged.
 
 As discussed in {{migration-linkability}}, each connection ID MUST be used on
 packets sent from only one local address.  An endpoint that migrates away from a
@@ -1930,7 +1955,7 @@ experiencing congestion.
 On receiving an IP packet with an ECT or CE codepoint, an endpoint that can
 access the IP ECN codepoints increases the corresponding ECT(0), ECT(1), or CE
 count for each QUIC packet in the IP packet, and includes these counters in
-subsequent (see {{processing-and-ack}}) ACK_ECN frames (see {{frame-ack-ecn}}).
+subsequent (see {{processing-and-ack}}) ACK frames (see {{frame-ack-ecn}}).
 
 A QUIC packet detected by a receiver as a duplicate does not affect the receiver's
 local ECN codepoint counts; see ({{security-ecn}}) for relevant security
@@ -1947,14 +1972,14 @@ ACK frame, the endpoint stops setting ECT codepoints in subsequent packets, with
 the expectation that either the network or the peer no longer supports ECN.
 
 To protect the connection from arbitrary corruption of ECN codepoints by the
-network, an endpoint verifies the following when an ACK_ECN frame is received:
+network, an endpoint verifies the following when an ACK frame is received:
 
 * The increase in ECT(0) and ECT(1) counters MUST be at least the number of
   packets newly acknowledged that were sent with the corresponding codepoint.
 
-* The total increase in ECT(0), ECT(1), and CE counters reported in the ACK_ECN
+* The total increase in ECT(0), ECT(1), and CE counters reported in the ACK
   frame MUST be at least the total number of packets newly acknowledged in this
-  ACK_ECN frame.
+  ACK frame.
 
 An endpoint could miss acknowledgements for a packet when ACK frames are lost.
 It is therefore possible for the total increase in ECT(0), ECT(1), and CE
@@ -3034,9 +3059,9 @@ Maximum Data:
 All data sent in STREAM frames counts toward this limit.  The sum of the largest
 received offsets on all streams - including streams in terminal states - MUST
 NOT exceed the value advertised by a receiver.  An endpoint MUST terminate a
-connection with a QUIC_FLOW_CONTROL_RECEIVED_TOO_MUCH_DATA error if it receives
-more data than the maximum data value that it has sent, unless this is a result
-of a change in the initial limits (see {{zerortt-parameters}}).
+connection with a FLOW_CONTROL_ERROR error if it receives more data than the
+maximum data value that it has sent, unless this is a result of a change in
+the initial limits (see {{zerortt-parameters}}).
 
 
 ## MAX_STREAM_DATA Frame {#frame-max-stream-data}
@@ -3245,7 +3270,9 @@ The NEW_CONNECTION_ID frame is as follows:
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|   Length (8)  |          Connection ID (32..144)            ...
+|   Length (8)  |            Sequence Number (i)              ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Connection ID (32..144)                  ...
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                                                               |
 +                                                               +
@@ -3265,6 +3292,11 @@ Length:
   less than 4 and greater than 18 are invalid and MUST be treated as a
   connection error of type PROTOCOL_VIOLATION.
 
+Sequence Number:
+
+: The sequence number assigned to the connection ID by the sender.  See
+  {{issuing-connection-ids}}.
+
 Connection ID:
 
 : A connection ID of the specified length.
@@ -3282,59 +3314,15 @@ zero-length Destination Connection ID MUST treat receipt of a NEW_CONNECTION_ID
 frame as a connection error of type PROTOCOL_VIOLATION.
 
 Transmission errors, timeouts and retransmissions might cause the same
-NEW_CONNECTION_ID frame to be received multiple times. Receipt of the same
-frame multiple times MUST NOT be treated as a connection error.
+NEW_CONNECTION_ID frame to be received multiple times.  Receipt of the same
+frame multiple times MUST NOT be treated as a connection error.  A receiver can
+use the sequence number supplied in the NEW_CONNECTION_ID frame to identify new
+connection IDs from old ones.
 
-If an endpoint receives a NEW_CONNECTION_ID frame that repeats the same
-connection ID as a previous NEW_CONNECTION_ID frame but with a different
-Stateless Reset Token or a different Sequence, the endpoint MAY
-treat that receipt as a connection error of type PROTOCOL_VIOLATION.
-Similarly, if an endpoint receives a NEW_CONNECTION_ID frame that repeats
-the Source Connection ID used by the peer during the initial
-handshake, it MUST treat that receipt as a connection error of type
-PROTOCOL_VIOLATION.
-
-## RETIRE_CONNECTION_ID Frame {#frame-retire-connection-id}
-
-An endpoint sends a RETIRE_CONNECTION_ID frame (type=0x1b) to indicate that it
-will no longer use a connection ID that was issued by its peer. This may include
-the connection ID provided during the handshake.  Sending a RETIRE_CONNECTION_ID
-frame also serves as a request to the peer to send additional connection IDs for
-future use (see {{connection-id}}).  New connection IDs can be delivered to a
-peer using the NEW_CONNECTION_ID frame ({{frame-new-connection-id}}).
-
-Retiring a connection ID invalidates the stateless reset token associated with
-that connection ID.
-
-The RETIRE_CONNECTION_ID frame is as follows:
-
-~~~
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|   Length (8)  |          Connection ID (32..144)            ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-~~~
-
-The fields are:
-
-Length:
-
-: An 8-bit unsigned integer containing the length of the connection ID.
-
-Connection ID:
-
-: A connection ID of the specified length.
-
-Receipt of a RETIRE_CONNECTION_ID frame containing a connection ID that was not
-previously sent to the peer MAY be treated as a connection error of type
-PROTOCOL_VIOLATION.
-
-An endpoint cannot send this frame if it was provided with a zero-length
-connection ID by its peer.  An endpoint that provides a zero-length connection
-ID MUST treat receipt of a RETIRE_CONNECTION_ID frame as a connection error of
+If an endpoint receives a NEW_CONNECTION_ID frame that repeats a previously
+issued connection ID with a different Stateless Reset Token or a different
+sequence number, the endpoint MAY treat that receipt as a connection error of
 type PROTOCOL_VIOLATION.
-
 
 ## STOP_SENDING Frame {#frame-stop-sending}
 
@@ -3372,12 +3360,51 @@ Application Error Code:
 : A 16-bit, application-specified reason the sender is ignoring the stream (see
   {{app-error-codes}}).
 
+## RETIRE_CONNECTION_ID Frame {#frame-retire-connection-id}
+
+An endpoint sends a RETIRE_CONNECTION_ID frame (type=0x0d) to indicate that it
+will no longer use a connection ID that was issued by its peer. This may include
+the connection ID provided during the handshake.  Sending a RETIRE_CONNECTION_ID
+frame also serves as a request to the peer to send additional connection IDs for
+future use (see {{connection-id}}).  New connection IDs can be delivered to a
+peer using the NEW_CONNECTION_ID frame ({{frame-new-connection-id}}).
+
+Retiring a connection ID invalidates the stateless reset token associated with
+that connection ID.
+
+The RETIRE_CONNECTION_ID frame is as follows:
+
+~~~
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                      Sequence Number (i)                    ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+~~~
+
+The fields are:
+
+Sequence Number:
+
+: The sequence number of the connection ID being retired.  See
+  {{retiring-cids}}.
+
+Receipt of a RETIRE_CONNECTION_ID frame containing a sequence number greater
+than any previously sent to the peer MAY be treated as a connection error of
+type PROTOCOL_VIOLATION.
+
+An endpoint cannot send this frame if it was provided with a zero-length
+connection ID by its peer.  An endpoint that provides a zero-length connection
+ID MUST treat receipt of a RETIRE_CONNECTION_ID frame as a connection error of
+type PROTOCOL_VIOLATION.
 
 ## ACK Frame {#frame-ack}
 
-Receivers send ACK frames (type=0x0d) to inform senders which packets they have
-received and processed. The ACK frame contains any number of ACK blocks.
-ACK blocks are ranges of acknowledged packets.
+Receivers send ACK frames (types 0x1a and 0x1b) to inform senders of packets
+they have received and processed. The ACK frame contains one or more ACK Blocks.
+ACK Blocks are ranges of acknowledged packets. If the frame type is 0x1b, ACK
+frames also contain the sum of ECN marks received on the connection up until
+this point.
 
 QUIC acknowledgements are irrevocable.  Once acknowledged, a packet remains
 acknowledged, even if it does not appear in a future ACK frame.  This is unlike
@@ -3405,6 +3432,8 @@ An ACK frame is shown below.
 |                       ACK Block Count (i)                   ...
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                          ACK Blocks (*)                     ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         [ECN Section]                       ...
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ~~~
 {: #ack-format title="ACK Frame Format"}
@@ -3445,14 +3474,18 @@ ACK Blocks:
 
 The ACK Block Section consists of alternating Gap and ACK Block fields in
 descending packet number order.  A First Ack Block field is followed by a
-variable number of alternating Gap and Additional ACK Blocks.  The number of Gap
-and Additional ACK Block fields is determined by the ACK Block Count field.
+variable number of alternating Gap and Additional ACK Blocks.  The number of
+Gap and Additional ACK Block fields is determined by the ACK Block Count field.
 
 Gap and ACK Block fields use a relative integer encoding for efficiency.  Though
 each encoded value is positive, the values are subtracted, so that each ACK
 Block describes progressively lower-numbered packets.  As long as contiguous
 ranges of packets are small, the variable-length integer encoding ensures that
 each range can be expressed in a small number of octets.
+
+The ACK frame uses the least significant bit(bit (that is, type 0x1b) to
+indicate ECN feedback and report receipt of packets with ECN codepoints of
+ECT(0), ECT(1), or CE in the packet's IP header.
 
 ~~~
  0                   1                   2                   3
@@ -3489,7 +3522,7 @@ the formula:
    smallest = largest - ack_block
 ~~~
 
-The range of packets that are acknowledged by the ACK block include the range
+The range of packets that are acknowledged by the ACK Block include the range
 from the smallest packet number to the largest, inclusive.
 
 The largest value for the First ACK Block is determined by the Largest
@@ -3501,7 +3534,7 @@ number of packets in the gap is one higher than the encoded value of the Gap
 Field.
 
 The value of the Gap field establishes the largest packet number value for the
-ACK block that follows the gap using the following formula:
+ACK Block that follows the gap using the following formula:
 
 ~~~
   largest = previous_smallest - gap - 2
@@ -3530,6 +3563,35 @@ Additional ACK Block (repeated):
   packets preceding the largest packet number, as determined by the
   preceding Gap.
 
+### ECN section
+
+The ECN section should only be parsed when the ACK frame type byte is 0x1b.
+The ECN section consists of 3 ECN counters as shown below.
+
+~~~
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        ECT(0) Count (i)                     ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        ECT(1) Count (i)                     ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        ECN-CE Count (i)                     ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+~~~
+
+ECT(0) Count:
+: A variable-length integer representing the total number packets received with
+  the ECT(0) codepoint.
+
+ECT(1) Count:
+: A variable-length integer representing the total number packets received with
+  the ECT(1) codepoint.
+
+CE Count:
+: A variable-length integer representing the total number packets received with
+  the CE codepoint.
+
 ### Sending ACK Frames
 
 Implementations MUST NOT generate packets that only contain ACK frames in
@@ -3550,7 +3612,7 @@ needing acknowledgement are received.  The sender can use the receiver's
 An acknowledgment SHOULD be sent immediately after receiving 2 packets that
 require acknowledgement, unless multiple packets are received together.
 
-To limit ACK blocks to those that have not yet been received by the sender, the
+To limit ACK Blocks to those that have not yet been received by the sender, the
 receiver SHOULD track which ACK frames have been acknowledged by its peer.  Once
 an ACK frame has been acknowledged, the packets it acknowledges SHOULD NOT be
 acknowledged again.
@@ -3564,7 +3626,7 @@ Endpoints can only acknowledge packets sent in a particular packet number
 space by sending ACK frames in packets from the same packet number space.
 
 To limit receiver state or the size of ACK frames, a receiver MAY limit the
-number of ACK blocks it sends.  A receiver can do this even without receiving
+number of ACK Blocks it sends.  A receiver can do this even without receiving
 acknowledgment of its ACK frames, with the knowledge this could cause the sender
 to unnecessarily retransmit some data.  Standard QUIC {{QUIC-RECOVERY}}
 algorithms declare packets lost after sufficiently newer packets are
@@ -3586,50 +3648,6 @@ data sent by the server protected by the 1-RTT keys.
 
 Endpoints SHOULD send acknowledgments for packets containing CRYPTO frames with
 a reduced delay; see Section 4.3.1 of {{QUIC-RECOVERY}}.
-
-
-## ACK_ECN Frame {#frame-ack-ecn}
-
-The ACK_ECN frame (type=0x1a) is used by an endpoint that provides ECN feedback
-for packets received with ECN codepoints of ECT(0), ECT(1), or CE in the
-packet's IP header.
-
-~~~
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                     Largest Acknowledged (i)                ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                          ACK Delay (i)                      ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        ECT(0) Count (i)                     ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        ECT(1) Count (i)                     ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        ECN-CE Count (i)                     ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                       ACK Block Count (i)                   ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                          ACK Blocks (*)                     ...
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-~~~
-{: #ACN_ECN_FRAME_FORMAT title="ACK_ECN Frame Format"}
-
-An ACK_ECN frame contains all the elements of the ACK frame ({{frame-ack}}) with
-the addition of three counts following the ACK Delay field.
-
-ECT(0) Count:
-: A variable-length integer representing the total number packets received with
-  the ECT(0) codepoint.
-
-ECT(1) Count:
-: A variable-length integer representing the total number packets received with
-  the ECT(1) codepoint.
-
-CE Count:
-: A variable-length integer representing the total number packets received with
-  the CE codepoint.
-
 
 ## PATH_CHALLENGE Frame {#frame-path-challenge}
 
@@ -3955,9 +3973,10 @@ containing that information is acknowledged.
   needed.
 
 * New connection IDs are sent in NEW_CONNECTION_ID frames and retransmitted if
-  the packet containing them is lost.  Likewise, retired connection IDs are sent
-  in RETIRE_CONNECTION_ID frames and retransmitted if the packet containing
-  them is lost.
+  the packet containing them is lost.  Retransmissions of this frame carry the
+  same sequence number value.  Likewise, retired connection IDs are sent in
+  RETIRE_CONNECTION_ID frames and retransmitted if the packet containing them is
+  lost.
 
 * PADDING frames contain no information, so lost PADDING frames do not require
   repair.
@@ -4191,6 +4210,9 @@ data to a peer.
        |                           |
        | Send STREAM /             |
        |      STREAM_BLOCKED       |
+       |                           |
+       | Create Bidirectional      |
+       |      Stream (Receiving)   |
        v                           |
    +-------+                       |
    | Send  | Send RST_STREAM       |
@@ -4219,14 +4241,14 @@ protocol.  The "Ready" state represents a newly created stream that is able to
 accept data from the application.  Stream data might be buffered in this state
 in preparation for sending.
 
-The sending part of a bidirectional stream initiated by a peer (type 0 for a
-server, type 1 for a client) enters the "Ready" state if the receiving part
-enters the "Recv" state.
-
 Sending the first STREAM or STREAM_BLOCKED frame causes a send stream to enter
 the "Send" state.  An implementation might choose to defer allocating a Stream
 ID to a send stream until it sends the first frame and enters this state, which
 can allow for better stream prioritization.
+
+The sending part of a bidirectional stream initiated by a peer (type 0 for a
+server, type 1 for a client) enters the "Ready" state then immediately
+transitions to the "Send" state if the receiving part enters the "Recv" state.
 
 In the "Send" state, an endpoint transmits - and retransmits as necessary - data
 in STREAM frames.  The endpoint respects the flow control limits of its peer,
@@ -5112,8 +5134,9 @@ The initial contents of this registry are shown in {{iana-tp-table}}.
 | 0x0009 | disable_migration           | {{transport-parameter-definitions}} |
 | 0x000a | initial_max_stream_data_bidi_remote | {{transport-parameter-definitions}} |
 | 0x000b | initial_max_stream_data_uni | {{transport-parameter-definitions}} |
+| 0x000c | max_ack_delay               | {{transport-parameter-definitions}} |
+| 0x000d | original_connection_id      | {{transport-parameter-definitions}} |
 {: #iana-tp-table title="Initial QUIC Transport Parameters Entries"}
-
 
 ## QUIC Frame Type Registry {#iana-frames}
 
@@ -5248,6 +5271,17 @@ DecodePacketNumber(largest_pn, truncated_pn, pn_nbits):
 > final version of this document.
 
 Issue and pull request numbers are listed with a leading octothorp.
+
+## Since draft-ietf-quic-transport-14
+
+- Merge ACK and ACK_ECN (#1778, #1801)
+- Explicitly communicate max_ack_delay (#981, #1781)
+- Validate original connection ID after Retry packets (#1710, #1486, #1793)
+- Idle timeout is optional and has no specified maximum (#1520, #1521)
+- Update connection ID handling; add RETIRE_CONNECTION_ID type (#1464, #1468,
+  #1483, #1484, #1486, #1495, #1729, #1742, #1799, #1821)
+- Include a Token in all Initial packets (#1649, #1794)
+- Prevent handshake deadlock (#1764, #1824)
 
 ## Since draft-ietf-quic-transport-13
 
